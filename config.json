@@ -1,0 +1,8 @@
+{
+    "verify_url":       "https://bucac.onrender.com/api/verify-key",
+    "countdown":        30,
+    "cache_key":        true,
+    "keychain_service": "com.keychecker.app",
+    "min_ios":          "14.0",
+    "arch":             "arm64"
+}
