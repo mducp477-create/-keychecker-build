@@ -1,0 +1,238 @@
+name: 🔨 Build KeyChecker + Inject IPA
+
+on:
+  # Trigger thủ công từ GitHub web hoặc script Python
+  workflow_dispatch:
+    inputs:
+      verify_url:
+        description: 'URL server verify key'
+        required: true
+        default: 'https://bucac.onrender.com/api/verify-key'
+      countdown:
+        description: 'Đếm ngược (giây)'
+        required: true
+        default: '30'
+      cache_key:
+        description: 'Cache key vào Keychain (true/false)'
+        required: true
+        default: 'true'
+      keychain_service:
+        description: 'Keychain service ID'
+        required: true
+        default: 'com.keychecker.app'
+      min_ios:
+        description: 'Min iOS version'
+        required: true
+        default: '14.0'
+      arch:
+        description: 'Architecture (arm64/universal)'
+        required: true
+        default: 'arm64'
+
+  # Hoặc trigger khi push file IPA vào repo
+  push:
+    paths:
+      - 'input/*.ipa'
+      - 'config.json'
+
+jobs:
+  build:
+    runs-on: macos-latest   # ← Mac cloud miễn phí của GitHub
+
+    steps:
+      # ── 1. Checkout repo ────────────────────────────────────────────────────
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Đọc config (nếu có config.json trong repo) ──────────────────────
+      - name: 📋 Load config
+        id: config
+        run: |
+          if [ -f config.json ]; then
+            echo "Dùng config.json"
+            VERIFY_URL=$(python3 -c "import json;d=json.load(open('config.json'));print(d.get('verify_url','${{ github.event.inputs.verify_url }}'))")
+            COUNTDOWN=$(python3   -c "import json;d=json.load(open('config.json'));print(d.get('countdown','${{ github.event.inputs.countdown }}'))")
+            CACHE_KEY=$(python3   -c "import json;d=json.load(open('config.json'));print(str(d.get('cache_key',True)).lower())")
+            KC_SERVICE=$(python3  -c "import json;d=json.load(open('config.json'));print(d.get('keychain_service','${{ github.event.inputs.keychain_service }}'))")
+            MIN_IOS=$(python3     -c "import json;d=json.load(open('config.json'));print(d.get('min_ios','${{ github.event.inputs.min_ios }}'))")
+            ARCH=$(python3        -c "import json;d=json.load(open('config.json'));print(d.get('arch','${{ github.event.inputs.arch }}'))")
+          else
+            VERIFY_URL="${{ github.event.inputs.verify_url }}"
+            COUNTDOWN="${{ github.event.inputs.countdown }}"
+            CACHE_KEY="${{ github.event.inputs.cache_key }}"
+            KC_SERVICE="${{ github.event.inputs.keychain_service }}"
+            MIN_IOS="${{ github.event.inputs.min_ios }}"
+            ARCH="${{ github.event.inputs.arch }}"
+          fi
+          # Fallback defaults
+          VERIFY_URL="${VERIFY_URL:-https://bucac.onrender.com/api/verify-key}"
+          COUNTDOWN="${COUNTDOWN:-30}"
+          CACHE_KEY="${CACHE_KEY:-true}"
+          KC_SERVICE="${KC_SERVICE:-com.keychecker.app}"
+          MIN_IOS="${MIN_IOS:-14.0}"
+          ARCH="${ARCH:-arm64}"
+
+          echo "verify_url=$VERIFY_URL"   >> $GITHUB_OUTPUT
+          echo "countdown=$COUNTDOWN"     >> $GITHUB_OUTPUT
+          echo "cache_key=$CACHE_KEY"     >> $GITHUB_OUTPUT
+          echo "kc_service=$KC_SERVICE"   >> $GITHUB_OUTPUT
+          echo "min_ios=$MIN_IOS"         >> $GITHUB_OUTPUT
+          echo "arch=$ARCH"               >> $GITHUB_OUTPUT
+
+          echo "✅ Config loaded:"
+          echo "   verify_url  = $VERIFY_URL"
+          echo "   countdown   = $COUNTDOWN"
+          echo "   cache_key   = $CACHE_KEY"
+          echo "   min_ios     = $MIN_IOS"
+          echo "   arch        = $ARCH"
+
+      # ── 3. Generate KeyChecker.m ────────────────────────────────────────────
+      - name: 📝 Generate KeyChecker.m
+        run: |
+          python3 generate_source.py \
+            --verify-url  "${{ steps.config.outputs.verify_url }}" \
+            --countdown   "${{ steps.config.outputs.countdown }}" \
+            --cache-key   "${{ steps.config.outputs.cache_key }}" \
+            --kc-service  "${{ steps.config.outputs.kc_service }}" \
+            --output      KeyChecker.m
+
+          echo "✅ KeyChecker.m generated ($(wc -l < KeyChecker.m) lines)"
+
+      # ── 4. Build dylib ──────────────────────────────────────────────────────
+      - name: 🔨 Build KeyChecker.dylib
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          ARCH="${{ steps.config.outputs.arch }}"
+          MIN_IOS="${{ steps.config.outputs.min_ios }}"
+          mkdir -p output
+
+          if [ "$ARCH" = "universal" ]; then
+            echo "Building arm64..."
+            xcrun clang -arch arm64 -isysroot "$SDK" \
+              -framework UIKit -framework Foundation -framework Security \
+              -dynamiclib -fobjc-arc -O2 \
+              -miphoneos-version-min=$MIN_IOS \
+              -install_name @rpath/KeyChecker.dylib \
+              -Wno-deprecated-declarations \
+              KeyChecker.m -o output/KeyChecker_arm64.dylib
+
+            echo "Building arm64e..."
+            xcrun clang -arch arm64e -isysroot "$SDK" \
+              -framework UIKit -framework Foundation -framework Security \
+              -dynamiclib -fobjc-arc -O2 \
+              -miphoneos-version-min=$MIN_IOS \
+              -install_name @rpath/KeyChecker.dylib \
+              -Wno-deprecated-declarations \
+              KeyChecker.m -o output/KeyChecker_arm64e.dylib
+
+            echo "Creating fat binary..."
+            lipo -create output/KeyChecker_arm64.dylib output/KeyChecker_arm64e.dylib \
+                 -output output/KeyChecker.dylib
+            rm output/KeyChecker_arm64.dylib output/KeyChecker_arm64e.dylib
+          else
+            xcrun clang -arch $ARCH -isysroot "$SDK" \
+              -framework UIKit -framework Foundation -framework Security \
+              -dynamiclib -fobjc-arc -O2 \
+              -miphoneos-version-min=$MIN_IOS \
+              -install_name @rpath/KeyChecker.dylib \
+              -Wno-deprecated-declarations \
+              KeyChecker.m -o output/KeyChecker.dylib
+          fi
+
+          # Ad-hoc sign
+          codesign --force --sign - --timestamp=none output/KeyChecker.dylib
+          echo "✅ Built: $(ls -lh output/KeyChecker.dylib | awk '{print $5}')"
+          lipo -info output/KeyChecker.dylib
+
+      # ── 5. Install insert_dylib ─────────────────────────────────────────────
+      - name: 📦 Install insert_dylib
+        run: |
+          # Build insert_dylib từ source (không cần brew)
+          git clone --depth=1 https://github.com/Tyilo/insert_dylib /tmp/insert_dylib_src
+          cd /tmp/insert_dylib_src
+          xcodebuild -project insert_dylib.xcodeproj \
+                     -scheme insert_dylib \
+                     -configuration Release \
+                     SYMROOT=/tmp/insert_dylib_build \
+                     build 2>&1 | tail -5
+          cp /tmp/insert_dylib_build/Release/insert_dylib /usr/local/bin/insert_dylib
+          chmod +x /usr/local/bin/insert_dylib
+          echo "✅ insert_dylib installed"
+
+      # ── 6. Inject IPA (nếu có file IPA trong repo) ─────────────────────────
+      - name: 💉 Inject IPA
+        run: |
+          IPA_FILES=$(find input/ -name "*.ipa" 2>/dev/null | head -1)
+
+          if [ -z "$IPA_FILES" ]; then
+            echo "⚠️ Không có file IPA trong folder input/ — bỏ qua bước inject"
+            echo "   Chỉ output KeyChecker.dylib"
+            exit 0
+          fi
+
+          IPA="$IPA_FILES"
+          BASENAME=$(basename "$IPA" .ipa)
+          echo "🎯 Injecting into: $IPA"
+
+          # Extract
+          mkdir -p /tmp/inject_work/extracted
+          unzip -q "$IPA" -d /tmp/inject_work/extracted
+
+          # Tìm .app
+          APP=$(find /tmp/inject_work/extracted/Payload -name "*.app" -maxdepth 1 -type d | head -1)
+          BINARY_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist")
+          BINARY="$APP/$BINARY_NAME"
+
+          echo "   App:    $(basename $APP)"
+          echo "   Binary: $BINARY_NAME"
+          echo "   Archs:  $(lipo -info "$BINARY" 2>/dev/null | sed 's/.*://')"
+
+          # Copy dylib
+          cp output/KeyChecker.dylib "$APP/"
+
+          # Inject
+          insert_dylib --inplace --strip-codesig \
+              "@rpath/KeyChecker.dylib" "$BINARY"
+
+          # Add rpath
+          install_name_tool -add_rpath "@loader_path" "$BINARY" 2>/dev/null || true
+
+          # Sign everything
+          codesign --force --sign - --timestamp=none "$APP/KeyChecker.dylib"
+          find "$APP/Frameworks" -type f \( -name "*.dylib" -o -name "*.framework" \) \
+               -exec codesign --force --sign - --timestamp=none {} \; 2>/dev/null || true
+          codesign --force --sign - --timestamp=none --preserve-metadata=entitlements "$BINARY"
+          codesign --force --sign - --timestamp=none "$APP"
+
+          # Repack
+          cd /tmp/inject_work/extracted
+          zip -qr /tmp/inject_work/output.ipa Payload
+          cp /tmp/inject_work/output.ipa "$GITHUB_WORKSPACE/output/${BASENAME}_patched.ipa"
+
+          echo "✅ Injected: ${BASENAME}_patched.ipa"
+          ls -lh "$GITHUB_WORKSPACE/output/"
+
+      # ── 7. Upload artifacts ─────────────────────────────────────────────────
+      - name: 📤 Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: keychecker-output
+          path: output/
+          retention-days: 7   # giữ 7 ngày rồi tự xóa
+
+      # ── 8. Summary ──────────────────────────────────────────────────────────
+      - name: 📋 Summary
+        run: |
+          echo "## ✅ Build hoàn thành!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| File | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+          for f in output/*; do
+            SIZE=$(ls -lh "$f" | awk '{print $5}')
+            echo "| $(basename $f) | $SIZE |" >> $GITHUB_STEP_SUMMARY
+          done
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Config:**" >> $GITHUB_STEP_SUMMARY
+          echo "- verify_url: \`${{ steps.config.outputs.verify_url }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- countdown: \`${{ steps.config.outputs.countdown }}s\`" >> $GITHUB_STEP_SUMMARY
+          echo "- arch: \`${{ steps.config.outputs.arch }}\`" >> $GITHUB_STEP_SUMMARY
